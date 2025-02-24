@@ -141,6 +141,19 @@ class SonicConnection(BaseConnection):
                     ActionParameter("slippage", False, float, "Max slippage percentage")
                 ],
                 description="Swap tokens"
+            ),
+            "execute-transaction": Action(
+                name="execute-transaction",
+                parameters=[
+                    ActionParameter("to_address", True, str, "Contract address to interact with"),
+                    ActionParameter("data", False, str, "Transaction data in hex format (optional if using contract_call)"),
+                    ActionParameter("value", False, float, "Amount of native token to send (in $S)"),
+                    ActionParameter("gas_limit", False, int, "Gas limit for the transaction"),
+                    ActionParameter("contract_abi", False, str, "Contract ABI JSON string (required if using contract_call)"),
+                    ActionParameter("method_name", False, str, "Contract method name to call"),
+                    ActionParameter("method_args", False, str, "Arguments for the contract method call in JSON format")
+                ],
+                description="Execute arbitrary transaction with custom data or contract method call"
             )
         }
 
@@ -438,6 +451,192 @@ class SonicConnection(BaseConnection):
         except Exception as e:
             logger.error(f"Swap failed: {e}")
             raise
+
+    def _convert_parameter(self, param: Any, param_type: str) -> Any:
+        """Convert parameter to the correct type based on ABI
+        
+        Handles nested arrays recursively. For example:
+        - address[] -> ["0x123...", "0x456..."]
+        - uint256[][] -> [["1", "2"], ["3", "4"]]
+        """
+        try:
+            # Handle array types (e.g. uint256[], address[][])
+            if param_type.endswith('[]'):
+                if not isinstance(param, (list, tuple)):
+                    raise ValueError(f"Expected array for type {param_type}, got {type(param)}")
+                
+                # Get the base type by removing the array suffix
+                base_type = param_type.rstrip('[]')
+                # Count the number of array dimensions
+                array_dims = param_type.count('[]')
+                
+                if array_dims == 1:
+                    # Single dimension array
+                    return [self._convert_parameter(item, base_type) for item in param]
+                else:
+                    # Multi-dimensional array - recursively handle nested arrays
+                    nested_type = base_type + '[]' * (array_dims - 1)
+                    return [self._convert_parameter(item, nested_type) for item in param]
+            
+            # Handle address type
+            if param_type.startswith('address'):
+                # Allow both checksummed and non-checksummed addresses
+                return Web3.to_checksum_address(str(param).lower())
+            
+            # Handle integer types (uint/int)
+            if param_type.startswith(('uint', 'int')):
+                return int(param)
+            
+            # Handle boolean
+            if param_type == 'bool':
+                if isinstance(param, bool):
+                    return param
+                if isinstance(param, str):
+                    return param.lower() in ('true', '1', 'yes')
+                return bool(param)
+            
+            # Handle bytes and byte arrays
+            if param_type.startswith('bytes'):
+                if isinstance(param, bytes):
+                    return param.hex()
+                if isinstance(param, str):
+                    if param.startswith('0x'):
+                        return param
+                    return '0x' + param
+                raise ValueError(f"Cannot convert {type(param)} to bytes")
+            
+            # Handle strings and other types
+            return param
+            
+        except Exception as e:
+            logger.warning(f"Parameter conversion warning for {param} to {param_type}: {str(e)}")
+            return param
+
+    def _get_parameter_types(self, contract_abi: list, method_name: str) -> list:
+        """Get parameter types from ABI for a specific method"""
+        for item in contract_abi:
+            if item.get('name') == method_name and item.get('type') == 'function':
+                return [input_['type'] for input_ in item.get('inputs', [])]
+        return []
+
+    def execute_transaction(
+        self, 
+        to_address: str, 
+        data: Optional[str] = None, 
+        value: float = 0, 
+        gas_limit: Optional[int] = None,
+        contract_abi: Optional[str] = None,
+        method_name: Optional[str] = None,
+        method_args: Optional[str] = None
+    ) -> str:
+        """Execute arbitrary transaction with custom data or contract method call"""
+        try:
+            private_key = os.getenv('SONIC_PRIVATE_KEY')
+            if not private_key:
+                raise SonicConnectionError("No wallet private key configured in .env")
+
+            # Convert to_address to checksum format, but handle invalid addresses gracefully
+            try:
+                to_address = Web3.to_checksum_address(to_address.lower())
+            except Exception as e:
+                logger.warning(f"Address checksum warning: {str(e)}")
+
+            account = self._web3.eth.account.from_key(private_key)
+            
+            # Build transaction data from contract call if provided
+            if contract_abi and method_name:
+                try:
+                    # Parse ABI
+                    if isinstance(contract_abi, str):
+                        import json
+                        contract_abi = json.loads(contract_abi)
+                    
+                    # Parse method arguments from JSON string
+                    if method_args:
+                        try:
+                            parsed_args = json.loads(method_args)
+                            if not isinstance(parsed_args, list):
+                                parsed_args = [parsed_args]
+                        except json.JSONDecodeError as e:
+                            raise ValueError(f"Invalid JSON format for method_args: {str(e)}")
+                    else:
+                        parsed_args = []
+
+                    # Get parameter types from ABI
+                    param_types = self._get_parameter_types(contract_abi, method_name)
+                    
+                    # Convert parameters to correct types
+                    if len(param_types) != len(parsed_args):
+                        raise ValueError(f"Number of arguments ({len(parsed_args)}) does not match method signature ({len(param_types)})")
+                    
+                    converted_args = [
+                        self._convert_parameter(arg, param_type)
+                        for arg, param_type in zip(parsed_args, param_types)
+                    ]
+                    
+                    # Create contract instance
+                    contract = self._web3.eth.contract(
+                        address=to_address,
+                        abi=contract_abi
+                    )
+                    
+                    # Get method object
+                    contract_method = getattr(contract.functions, method_name)
+                    if not contract_method:
+                        raise ValueError(f"Method {method_name} not found in contract ABI")
+                    
+                    # Build method call with converted arguments
+                    method_call = contract_method(*converted_args)
+
+                    tx_params = {
+                        'from': account.address,
+                        'value': self._web3.to_wei(value, 'ether'),
+                        'nonce': self._web3.eth.get_transaction_count(account.address),
+                        'gasPrice': self._web3.eth.gas_price,
+                        'chainId': self._web3.eth.chain_id
+                    }
+
+                    # Get transaction data
+                    data = method_call.build_transaction(tx_params)['data']
+                    
+                except Exception as e:
+                    raise ValueError(f"Failed to build contract call: {str(e)}")
+            elif not data:
+                raise ValueError("Either 'data' or both 'contract_abi' and 'method_name' must be provided")
+            
+            # Prepare transaction
+            tx = {
+                'from': account.address,
+                'to': Web3.to_checksum_address(to_address),
+                'data': data,
+                'value': self._web3.to_wei(value, 'ether'),
+                'nonce': self._web3.eth.get_transaction_count(account.address),
+                'gasPrice': self._web3.eth.gas_price,
+                'chainId': self._web3.eth.chain_id
+            }
+
+            # Estimate gas if not provided
+            if gas_limit is None or gas_limit <= 0:
+                try:
+                    gas_estimate = self._web3.eth.estimate_gas(tx)
+                    tx['gas'] = int(gas_estimate * 1.2)  # Add 20% buffer
+                except Exception as e:
+                    logger.warning(f"Gas estimation failed: {e}, using default gas limit")
+                    tx['gas'] = 500000
+            else:
+                tx['gas'] = gas_limit
+
+            # Sign and send transaction
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = self._web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_url = self._get_explorer_link(tx_hash.hex())
+            
+            return f"Transaction sent successfully! View at: {tx_url}"
+
+        except Exception as e:
+            logger.error(f"Transaction execution failed: {str(e)}")
+            raise ValueError(f"Failed to execute transaction: {str(e)}")
+
     def perform_action(self, action_name: str, kwargs) -> Any:
         """Execute a Sonic action with validation"""
         if action_name not in self.actions:
