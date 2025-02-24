@@ -79,6 +79,8 @@ class ZerePyServer:
         self.state = ServerState()
         self.setup_routes()
 
+        self.state.cli._load_default_agent()
+
     def setup_routes(self):
         @self.app.get("/")
         async def root():
